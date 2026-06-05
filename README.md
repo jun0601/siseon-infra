@@ -9,10 +9,10 @@
 
 # StockOps — 멀티 하이브리드 클라우드 인프라
 
-> **팀명**: 시선 (SysSun — System Surveillance & Unified Network)
+> **팀명**: 시선 (SISEON)  
 > **주제**: AX 환경을 위한 ERP 솔루션 기반 멀티 하이브리드 클라우드 인프라 자동화 및 Observability 체계 구축
 
-StockOps는 K-Food 수출 기업(예: 비비고 만두)을 모델로 한 ERP/WMS 솔루션이다. 서울 본사가 운영을 총괄하고 미국 영업팀이 현지 영업을 지원하며, 멀티 리전·하이브리드 클라우드 위에서 동작한다.
+StockOps는 K-Food 수출 기업을 모델로 한 ERP/WMS 솔루션이다. 서울 본사가 운영을 총괄하고 미국 영업팀이 현지 영업을 지원하며, 멀티 리전·하이브리드 클라우드 위에서 동작한다.
 
 ---
 
@@ -23,20 +23,24 @@ StockOps는 K-Food 수출 기업(예: 비비고 만두)을 모델로 한 ERP/WMS
 - **온프레미스(한국)**: 센터/창고. 온도 센서 데이터 수집
 - **Azure 서울**: 백업 데이터 + 상시 로그 저장 (재해 복구용)
 
-**데이터**: AWS RDS Multi-AZ / 서울(Master) ↔ 오하이오(Slave) 동기화, 미국은 읽기 전용 / Azure에 백업·로그
-**트래픽**: Global Accelerator 지연 기반 라우팅 (한국→서울, 미국→오하이오), 리전 장애 시 페일오버
+**데이터**: AWS RDS Multi-AZ / 서울(Master) ↔ 오하이오(Slave) 동기화, 미국은 읽기 전용 / Azure에 백업·로그  
+**트래픽**: Global Accelerator 지연 기반 라우팅 (한국→서울, 미국→오하이오), 리전 장애 시 페일오버  
 **보안**: 미국 영업팀은 최소 권한으로 앱/DB 접근 (본사 영향 차단)
 
 ---
 
 ## 레포 구성
 
-| 레포 | 내용 |
-|------|------|
-| **Stockops-Infra** | Terraform IaC (modules + seoul, 추후 ohio) |
-| **Stockops-Application** | 앱 모노레포 (admin-web, ai-module, api-server, client-web) + GitHub Actions |
+| 레포 | 담당 | 내용 |
+|------|------|------|
+| [siseon-infra](https://github.com/jun0601/siseon-infra) | 김진우 | Terraform IaC (modules + seoul) |
+| [siseon-security](https://github.com/jun0601/siseon-security) | 이준형 | CloudTrail 보안/감사 모니터링 |
+| [siseon-infra-monitoring](https://github.com/jun0601/siseon-infra-monitoring) | 이준형 | EKS 인프라 모니터링 (Prometheus + Grafana) |
+| Stockops-Application | 이현수 | 앱 모노레포 + GitHub Actions CI/CD |
 
-### 애플리케이션 컴포넌트
+---
+
+## 애플리케이션 컴포넌트
 
 | 컴포넌트 | 기술 | 포트 | ALB 경로 |
 |----------|------|------|----------|
@@ -47,28 +51,44 @@ StockOps는 K-Food 수출 기업(예: 비비고 만두)을 모델로 한 ERP/WMS
 
 ---
 
+## 인프라 모듈 구성
+
+| 모듈 | 역할 |
+|------|------|
+| `modules/vpc` | Multi-AZ VPC, 퍼블릭/프라이빗/DB 서브넷 3-Tier |
+| `modules/alb` | L7 ALB + 타겟 그룹 4개 (경로 기반 라우팅) |
+| `modules/eks` | EKS 클러스터 + 노드그룹 + OIDC + LBC IAM |
+| `modules/db` | RDS PostgreSQL (프라이빗, 스토리지 자동확장 100GB) |
+| `modules/ecr` | ECR 레포 4개 (for_each 자동 생성) |
+| `modules/github-oidc` | GitHub Actions OIDC 인증 (Access Key 없음) |
+| `modules/iot` | AWS IoT Core + SQS + DLQ (센서 데이터 파이프라인) |
+
+---
+
 ## 배포 방법
 
 ### 사전 준비
-- AWS CLI 자격증명 설정
+- AWS CLI 자격증명 설정 (`aws configure sso --profile siseon`)
 - kubectl, terraform 설치
 - `terraform.tfvars`에 `db_username`, `db_password`, `jwt_secret` 등 설정
 
 ### 1. 인프라 배포
 
-```powershell
+```bash
 cd seoul
-
-# 최초 구축 시: EKS 클러스터가 없으면 provider 연결 문제로
-# kubernetes_manifest/kubectl_manifest가 plan에서 실패할 수 있음.
-# 그 경우 인프라 먼저 → kubeconfig → 전체 순으로 분리 실행.
 
 # (A) 클러스터가 이미 있는 경우 — 한 방에
 terraform apply -auto-approve
 
 # (B) 완전 처음(클러스터 없음) — 단계 분리
-terraform apply --% -auto-approve -target=module.seoul_vpc -target=module.seoul_alb -target=module.seoul_eks -target=module.seoul_db -target=module.seoul_ecr
-aws eks update-kubeconfig --region ap-northeast-2 --name seoul-cluster
+terraform apply -auto-approve \
+  -target=module.seoul_vpc \
+  -target=module.seoul_alb \
+  -target=module.seoul_eks \
+  -target=module.seoul_db \
+  -target=module.seoul_ecr
+
+aws eks update-kubeconfig --region ap-northeast-2 --name seoul-cluster --profile siseon
 terraform apply -auto-approve
 ```
 
@@ -76,19 +96,28 @@ terraform apply -auto-approve
 
 ### 2. Kubernetes Secret 생성
 
-```powershell
-kubectl create secret generic stockops-secret `
-  --from-literal=JWT_SECRET="<랜덤32자이상>" `
-  --from-literal=DB_USERNAME="<DB유저>" `
-  --from-literal=DB_PASSWORD="<DB비번>" `
+```bash
+kubectl create secret generic stockops-secret \
+  --from-literal=JWT_SECRET="<랜덤32자이상>" \
+  --from-literal=DB_USERNAME="<DB유저>" \
+  --from-literal=DB_PASSWORD="<DB비번>" \
   -n stockops
 ```
 
-### 3. 애플리케이션 이미지 배포 (GitHub Actions)
+### 3. GitHub Actions OIDC 설정
 
-ECR 리포가 생성된 뒤, Stockops-Application의 GitHub Actions로 이미지를 빌드/푸시한다.
+> ⚠️ **배포 전 필수 수정사항**  
+> `modules/github-oidc/variables.tf` 에서 아래 값을 본인 레포 정보로 변경해야 합니다.
 
-```powershell
+```hcl
+github_org      = "jun0601"           # GitHub 계정명
+github_repo     = "Stockops-Application"  # 애플리케이션 레포명
+allowed_branches = ["main"]           # 허용할 브랜치
+```
+
+이후 Stockops-Application 레포의 GitHub Actions로 이미지를 빌드/푸시:
+
+```bash
 # main 브랜치 push 또는 수동 트리거
 gh workflow run deploy.yml
 ```
@@ -97,16 +126,18 @@ gh workflow run deploy.yml
 
 ### 4. 검증
 
-```powershell
+```bash
 kubectl get pods -n stockops
 kubectl get targetgroupbinding -n stockops
+
 # api 헬스체크
 kubectl exec -it <api-pod> -n stockops -- curl -s localhost:8080/actuator/health
-```
 
-ALB DNS로 접속:
-```powershell
-aws elbv2 describe-load-balancers --names seoul-alb --query "LoadBalancers[0].DNSName" --output text
+# ALB DNS 확인
+aws elbv2 describe-load-balancers \
+  --names seoul-alb \
+  --query "LoadBalancers[0].DNSName" \
+  --output text
 ```
 
 ### 5. 초기 로그인 계정
@@ -115,15 +146,29 @@ aws elbv2 describe-load-balancers --names seoul-alb --query "LoadBalancers[0].DN
 - 이메일: `admin@stockops.com`
 - 비밀번호: `admin123`
 
-테스트 계정(manager/staff/user)은 `STOCKOPS_TEST_ACCOUNTS_PASSWORD` 환경변수 설정 시에만 생성된다.
+---
+
+## 인프라 모니터링 연동
+
+EKS 배포 완료 후 `siseon-infra-monitoring` 레포를 배포하면 Grafana 대시보드가 자동으로 구성됩니다.
+
+```bash
+git clone https://github.com/jun0601/siseon-infra-monitoring.git
+cd siseon-infra-monitoring
+terraform init && terraform apply
+```
 
 ---
 
 ## 종료 (destroy)
 
-```powershell
+```bash
 # TGB 먼저 (LBC 살아있을 때)
-terraform destroy --% -auto-approve -target=kubectl_manifest.client_tgb -target=kubectl_manifest.admin_tgb -target=kubectl_manifest.api_tgb -target=kubectl_manifest.ai_tgb
+terraform destroy -auto-approve \
+  -target=kubectl_manifest.client_tgb \
+  -target=kubectl_manifest.admin_tgb \
+  -target=kubectl_manifest.api_tgb \
+  -target=kubectl_manifest.ai_tgb
 
 # 전체
 terraform destroy -auto-approve
@@ -132,29 +177,37 @@ terraform destroy -auto-approve
 kubectl delete targetgroupbinding --all -n stockops
 ```
 
-### destroy 후 잔재 확인 (중요)
+### destroy 후 잔재 확인
 
-```powershell
-# IAM Role — Terraform이 추적 못 하면 재구축 시 "already exists" 발생
-aws iam list-roles --query "Roles[?contains(RoleName, 'seoul')].RoleName" --output table
+```bash
+# IAM Role 확인
+aws iam list-roles \
+  --query "Roles[?contains(RoleName, 'seoul')].RoleName" \
+  --output table
 
-# 과금 리소스
-aws ec2 describe-nat-gateways --filter "Name=state,Values=available" --query "NatGateways[*].NatGatewayId" --output table
-aws rds describe-db-instances --query "DBInstances[*].DBInstanceIdentifier" --output table
-aws elbv2 describe-load-balancers --query "LoadBalancers[*].LoadBalancerName" --output table
+# 과금 리소스 확인
+aws ec2 describe-nat-gateways \
+  --filter "Name=state,Values=available" \
+  --query "NatGateways[*].NatGatewayId" \
+  --output table
+
+aws rds describe-db-instances \
+  --query "DBInstances[*].DBInstanceIdentifier" \
+  --output table
 ```
 
-남을 수 있는 IAM: `seoul-eks-cluster-role`, `seoul-eks-node-role`, `seoul-lbc-role`, 커스텀 정책 `seoul-lbc-policy`. 정책을 detach 후 role 삭제.
+남을 수 있는 IAM: `seoul-eks-cluster-role`, `seoul-eks-node-role`, `seoul-lbc-role`, `seoul-lbc-policy`  
+정책을 detach 후 role 삭제 필요.
 
 ---
 
 ## 추가 예정 (로드맵)
 
-- **호스트 분리**: Route 53 + ACM으로 `admin.도메인` / `client.도메인` 분리 → 서브패스 쿠키 문제 근본 해결
+- **Route 53 + ACM**: `admin.도메인` / `client.도메인` 호스트 분리
 - **멀티 리전**: 오하이오 리전 확장 + ECR replication
-- **Secrets Manager**: ESO(설치됨) 연동으로 DB/JWT 시크릿 자동 동기화, RDS `manage_master_user_password`
+- **Secrets Manager**: ESO 연동으로 DB/JWT 시크릿 자동 동기화
 - **온프레미스 연동**: Site-to-Site VPN
 - **센서 파이프라인**: IoT Core → SQS → 백엔드 분석
-- **기타**: S3, Global Accelerator, Observability 스택
+- **Global Accelerator**: 멀티 리전 트래픽 라우팅
 
-자세한 아키텍처는 `ARCHITECTURE.md`, AWS 리소스 목록은 `AWS_RESOURCES.md` 참고.
+자세한 아키텍처는 `Architecture.md`, AWS 리소스 목록은 `AWS_resources.md` 참고.
